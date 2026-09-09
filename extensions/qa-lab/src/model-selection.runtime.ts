@@ -1,31 +1,15 @@
+// Qa Lab plugin module implements model selection behavior.
 import {
-  listProfilesForProvider,
-  loadAuthProfileStoreForRuntime,
-} from "openclaw/plugin-sdk/agent-runtime";
-import { resolveEnvApiKey } from "openclaw/plugin-sdk/provider-auth";
-import { defaultQaModelForMode, type QaProviderModeInput } from "./model-selection.js";
-
-const QA_CODEX_OAUTH_LIVE_MODEL = "openai-codex/gpt-5.4";
-
-export function resolveQaPreferredLiveModel() {
-  if (resolveEnvApiKey("openai")?.apiKey) {
-    return undefined;
-  }
-  try {
-    const store = loadAuthProfileStoreForRuntime(undefined, {
-      readOnly: true,
-      allowKeychainPrompt: false,
-    });
-    if (listProfilesForProvider(store, "openai").length > 0) {
-      return undefined;
-    }
-    return listProfilesForProvider(store, "openai-codex").length > 0
-      ? QA_CODEX_OAUTH_LIVE_MODEL
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
+  defaultQaModelForMode,
+  normalizeQaProviderMode,
+  type QaProviderMode,
+  type QaProviderModeInput,
+} from "./model-selection.js";
+import { DEFAULT_QA_LIVE_PROVIDER_MODE } from "./providers/index.js";
+import {
+  resolveQaLiveFrontierAlternateModel,
+  resolveQaLiveFrontierPreferredModel,
+} from "./providers/live-frontier/model-selection.runtime.js";
 
 export function defaultQaRuntimeModelForMode(
   mode: QaProviderModeInput,
@@ -34,8 +18,35 @@ export function defaultQaRuntimeModelForMode(
     preferredLiveModel?: string;
   },
 ) {
+  const preferredLiveModel =
+    options?.preferredLiveModel ??
+    (normalizeQaProviderMode(mode) === DEFAULT_QA_LIVE_PROVIDER_MODE
+      ? resolveQaLiveFrontierPreferredModel()
+      : undefined);
   return defaultQaModelForMode(mode, {
     ...options,
-    preferredLiveModel: options?.preferredLiveModel ?? resolveQaPreferredLiveModel(),
+    preferredLiveModel,
   });
+}
+
+export function resolveQaRuntimeModelPair(params: {
+  providerMode: QaProviderModeInput;
+  primaryModel?: string;
+  alternateModel?: string;
+  resolveDefaultModel?: (mode: QaProviderMode, alternate?: boolean) => string;
+}) {
+  const providerMode = normalizeQaProviderMode(params.providerMode);
+  const normalizeModel = (model: string | undefined) => model?.trim() || undefined;
+  const resolveDefaultModel =
+    params.resolveDefaultModel ??
+    ((mode: QaProviderModeInput, alternate = false) =>
+      defaultQaRuntimeModelForMode(mode, alternate ? { alternate: true } : undefined));
+  const primaryModel = normalizeModel(params.primaryModel) ?? resolveDefaultModel(providerMode);
+  const alternateModel =
+    normalizeModel(params.alternateModel) ??
+    (providerMode === DEFAULT_QA_LIVE_PROVIDER_MODE
+      ? (resolveQaLiveFrontierAlternateModel(primaryModel) ??
+        resolveDefaultModel(providerMode, true))
+      : resolveDefaultModel(providerMode, true));
+  return { primaryModel, alternateModel };
 }

@@ -1,5 +1,12 @@
+/**
+ * Channel legacy config rule collector.
+ *
+ * Gathers channel-owned doctor migration rules from public artifacts and plugin hooks.
+ */
 import type { LegacyConfigRule } from "../../config/legacy.shared.js";
+import type { OpenClawConfig } from "../../config/types.js";
 import { listPluginDoctorLegacyConfigRules } from "../../plugins/doctor-contract-registry.js";
+import { isChannelConfigMetadataKey } from "../config-metadata.js";
 import { getBootstrapChannelPlugin } from "./bootstrap-registry.js";
 import { loadBundledChannelDoctorContractApi } from "./doctor-contract-api.js";
 import type { ChannelId } from "./types.public.js";
@@ -13,7 +20,8 @@ function collectConfiguredChannelIds(raw: unknown): ChannelId[] {
     return [];
   }
   return Object.keys(channels)
-    .filter((channelId) => channelId !== "defaults")
+    .map((channelId) => channelId.trim())
+    .filter((channelId) => channelId && !isChannelConfigMetadataKey(channelId))
     .map((channelId) => channelId as ChannelId);
 }
 
@@ -24,6 +32,8 @@ function shouldIncludeLegacyRuleForTouchedPaths(
   if (!touchedPaths || touchedPaths.length === 0) {
     return true;
   }
+  // A rule is relevant when either side is a prefix of the other. This lets a
+  // changed parent path include child rules without scanning all config rules.
   return touchedPaths.some((touchedPath) => {
     const sharedLength = Math.min(rulePath.length, touchedPath.length);
     for (let index = 0; index < sharedLength; index += 1) {
@@ -38,10 +48,14 @@ function shouldIncludeLegacyRuleForTouchedPaths(
 function collectRelevantChannelIdsForTouchedPaths(params: {
   raw?: unknown;
   touchedPaths?: ReadonlyArray<ReadonlyArray<string>>;
+  excludedChannelIds?: ReadonlySet<ChannelId>;
 }): ChannelId[] {
   const channelIds = collectConfiguredChannelIds(params.raw);
+  const filteredChannelIds = params.excludedChannelIds?.size
+    ? channelIds.filter((channelId) => !params.excludedChannelIds?.has(channelId))
+    : channelIds;
   if (!params.touchedPaths || params.touchedPaths.length === 0) {
-    return channelIds;
+    return filteredChannelIds;
   }
 
   const touchedChannelIds = new Set<ChannelId>();
@@ -51,30 +65,39 @@ function collectRelevantChannelIdsForTouchedPaths(params: {
       continue;
     }
     if (!second) {
-      return channelIds;
+      return filteredChannelIds;
     }
-    if (second === "defaults") {
+    const channelId = second.trim();
+    if (!channelId || isChannelConfigMetadataKey(channelId)) {
       continue;
     }
-    touchedChannelIds.add(second as ChannelId);
+    // Channel ids are the second segment under channels.*; deeper touched paths
+    // still map back to the owning channel for rule collection.
+    touchedChannelIds.add(channelId as ChannelId);
   }
 
   if (touchedChannelIds.size === 0) {
     return [];
   }
-  return channelIds.filter((channelId) => touchedChannelIds.has(channelId));
+  return filteredChannelIds.filter((channelId) => touchedChannelIds.has(channelId));
 }
 
 export function collectChannelLegacyConfigRules(
   raw?: unknown,
   touchedPaths?: ReadonlyArray<ReadonlyArray<string>>,
+  excludedChannelIds?: ReadonlySet<ChannelId>,
 ): LegacyConfigRule[] {
-  const channelIds = collectRelevantChannelIdsForTouchedPaths({ raw, touchedPaths });
+  const channelIds = collectRelevantChannelIdsForTouchedPaths({
+    raw,
+    touchedPaths,
+    excludedChannelIds,
+  });
   const rules: LegacyConfigRule[] = [];
   const unresolvedChannelIds: ChannelId[] = [];
   for (const channelId of channelIds) {
-    const contractRules = loadBundledChannelDoctorContractApi(channelId)?.legacyConfigRules;
-    if (Array.isArray(contractRules) && contractRules.length > 0) {
+    const contractApi = loadBundledChannelDoctorContractApi(channelId);
+    const contractRules = contractApi?.legacyConfigRules;
+    if (Array.isArray(contractRules)) {
       rules.push(...contractRules);
       continue;
     }
@@ -84,11 +107,21 @@ export function collectChannelLegacyConfigRules(
       rules.push(...plugin.doctor.legacyConfigRules);
       continue;
     }
+    if (plugin) {
+      continue;
+    }
 
+    // Unknown configured channels may be externally installed plugins. Ask the
+    // plugin doctor registry only after bundled/bootstrap lookups miss.
     unresolvedChannelIds.push(channelId);
   }
   if (unresolvedChannelIds.length > 0) {
-    rules.push(...listPluginDoctorLegacyConfigRules({ pluginIds: unresolvedChannelIds }));
+    rules.push(
+      ...listPluginDoctorLegacyConfigRules({
+        config: raw as OpenClawConfig,
+        pluginIds: unresolvedChannelIds,
+      }),
+    );
   }
 
   const seen = new Set<string>();
